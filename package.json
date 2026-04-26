@@ -1,0 +1,16 @@
+{
+  "name": "forcetown-bot",
+  "version": "1.0.0",
+  "description": "Force Town ⛩️ Discord Bot for ForceLabs",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.0.0",
+    "@anthropic-ai/sdk": "^0.20.0",
+    "node-cron": "^3.0.0",
+    "dotenv": "^16.0.0"
+  }
+}
+

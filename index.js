@@ -37,6 +37,7 @@ const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY });
 // Falls back gracefully if POSTGRES_URL not set
 let db = null;
 if (process.env.POSTGRES_URL) {
+  // Railway Postgres — uses full connection URL
   db = new Pool({
     connectionString: process.env.POSTGRES_URL,
     ssl: { rejectUnauthorized: false },
@@ -45,9 +46,24 @@ if (process.env.POSTGRES_URL) {
     connectionTimeoutMillis: 5000,
   });
   db.on("error", (err) => console.error("DB pool error:", err));
-  console.log("DB pool created");
+  console.log("DB connected via POSTGRES_URL");
+} else if (process.env.POSTGRES_HOST) {
+  // Railway Postgres — uses individual variables as fallback
+  db = new Pool({
+    host:     process.env.POSTGRES_HOST,
+    port:     parseInt(process.env.POSTGRES_PORT || "5432"),
+    database: process.env.POSTGRES_DB,
+    user:     process.env.POSTGRES_USER,
+    password: process.env.POSTGRES_PASSWORD,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+  });
+  db.on("error", (err) => console.error("DB pool error:", err));
+  console.log("DB connected via individual POSTGRES_* vars");
 } else {
-  console.warn("WARNING: POSTGRES_URL not set — using in-memory storage (data resets on restart)");
+  console.warn("WARNING: No POSTGRES vars set — using in-memory storage (data resets on restart)");
 }
 
 // ── In-memory fallback ────────────────────────────────────────
@@ -474,15 +490,4 @@ async function handleSlash(i) {
       rows = Object.values(memUsers).sort((a,b) => b.level-a.level || b.xp-a.xp).slice(0,10)
         .map(u => ({ user_id: u.user_id, level: u.level, xp: u.xp }));
     }
-    const medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
-    const desc = rows.length
-      ? rows.map((x,idx) => `${medals[idx]} <@${x.user_id}> — Level **${x.level}** (${x.xp} XP)`).join("\n")
-      : "Koi active nahi abhi! Pehle chat karo! 😅";
-    return i.reply({ embeds: [new EmbedBuilder().setColor(0x8b5cf6).setTitle("🏆 Force Town Top Members ⛩️")
-      .setDescription(desc).setFooter({ text: "Grind karo, top pe aao! ⚡" }).setTimestamp()] });
-  }
-
-  if (c === "services") {
-    return i.reply({ embeds: [new EmbedBuilder().setColor(0x00e5ff).setTitle("⚡ ForceLabs — Kya Kya Milega?")
-      .addFields(
-        { name: "🛠️ Discord Development", val
+    const medals = [

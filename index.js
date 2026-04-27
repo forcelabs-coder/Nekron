@@ -1,35 +1,26 @@
 // ============================================================
-//  Nekron ⛩️ — Force Town Discord Bot
+//  Nekron ⛩️  —  Force Town Discord Bot  v4.0
 //  Built for ItzForcex1 / ForceLabs
+//  PostgreSQL + crash-safe error handling
 // ============================================================
-//
-//  SETUP:
-//  1. npm install discord.js @anthropic-ai/sdk node-cron dotenv
-//  2. Fill .env file (see .env.example)
-//  3. node nekron.js
-//
-//  SLASH COMMANDS (register once on startup automatically):
-//  /set channel:[channel] type:[dailyleaderboard|dailymessage|announcement|tickets|levelups]
-//  /send channel:[channel] message:[text]
-//  /ticket
-//  /rank
-//  /leaderboard
-//  /services
-//
-// ============================================================
-
-require('dotenv').config();
+"use strict";
+require("dotenv").config();
 
 const {
   Client, GatewayIntentBits, Partials,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   PermissionFlagsBits, ChannelType,
-  REST, Routes, SlashCommandBuilder,
-  ActivityType,
-} = require('discord.js');
-const Anthropic  = require('@anthropic-ai/sdk');
-const cron       = require('node-cron');
+  REST, Routes, SlashCommandBuilder, ActivityType,
+} = require("discord.js");
+const Anthropic = require("@anthropic-ai/sdk");
+const cron      = require("node-cron");
+const { Pool }  = require("pg");
 
+// ── Crash protection ──────────────────────────────────────────
+process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
+process.on("uncaughtException",  (err) => console.error("Uncaught exception:", err));
+
+// ── Clients ───────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -42,473 +33,456 @@ const client = new Client({
 
 const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY });
 
-// ── Persistent config (in-memory, survives restarts if you add a JSON file) ─
-const config = {
-  dailyLeaderboardChannel: process.env.DAILY_LB_CHANNEL    || null,
-  dailyMessageChannel:     process.env.DAILY_MSG_CHANNEL   || null,
-  announcementChannel:     process.env.ANNOUNCE_CHANNEL    || null,
-  ticketCategory:          process.env.TICKET_CATEGORY_ID  || null,
-  ticketLogChannel:        process.env.TICKET_LOG_CHANNEL  || null,
-  levelUpChannel:          process.env.LEVELUP_CHANNEL     || null,
+// ── DB setup ──────────────────────────────────────────────────
+// Falls back gracefully if POSTGRES_URL not set
+let db = null;
+if (process.env.POSTGRES_URL) {
+  db = new Pool({
+    connectionString: process.env.POSTGRES_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+  });
+  db.on("error", (err) => console.error("DB pool error:", err));
+  console.log("DB pool created");
+} else {
+  console.warn("WARNING: POSTGRES_URL not set — using in-memory storage (data resets on restart)");
+}
+
+// ── In-memory fallback ────────────────────────────────────────
+const memUsers  = {};
+const memConfig = {};
+const memTickets = {};
+
+// ── DB helpers ────────────────────────────────────────────────
+async function initDB() {
+  if (!db) return;
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS users (
+      user_id    TEXT PRIMARY KEY,
+      xp         INTEGER DEFAULT 0,
+      level      INTEGER DEFAULT 1,
+      msg_count  INTEGER DEFAULT 0,
+      daily_msgs INTEGER DEFAULT 0,
+      last_msg   BIGINT  DEFAULT 0,
+      has_spoken BOOLEAN DEFAULT FALSE
+    )`);
+    await db.query(`CREATE TABLE IF NOT EXISTS tickets (
+      user_id    TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL
+    )`);
+    await db.query(`CREATE TABLE IF NOT EXISTS bot_config (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    )`);
+    console.log("✅ DB tables ready");
+  } catch (e) {
+    console.error("DB init error:", e.message);
+  }
+}
+
+async function getUser(id) {
+  if (db) {
+    try {
+      const r = await db.query("SELECT * FROM users WHERE user_id=$1", [id]);
+      if (r.rows.length) return r.rows[0];
+      await db.query("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", [id]);
+    } catch (e) { console.error("getUser error:", e.message); }
+  }
+  if (!memUsers[id]) memUsers[id] = { user_id:id, xp:0, level:1, msg_count:0, daily_msgs:0, last_msg:0, has_spoken:false };
+  return memUsers[id];
+}
+
+async function updateUser(id, fields) {
+  if (db) {
+    try {
+      const keys = Object.keys(fields);
+      const vals = Object.values(fields);
+      const set  = keys.map((k, i) => `${k}=$${i+2}`).join(",");
+      await db.query(`UPDATE users SET ${set} WHERE user_id=$1`, [id, ...vals]);
+      return;
+    } catch (e) { console.error("updateUser error:", e.message); }
+  }
+  if (!memUsers[id]) memUsers[id] = await getUser(id);
+  Object.assign(memUsers[id], fields);
+}
+
+async function getConf(key) {
+  if (db) {
+    try {
+      const r = await db.query("SELECT value FROM bot_config WHERE key=$1", [key]);
+      return r.rows[0]?.value || null;
+    } catch (e) { console.error("getConf error:", e.message); }
+  }
+  return memConfig[key] || null;
+}
+
+async function setConf(key, val) {
+  if (db) {
+    try {
+      await db.query("INSERT INTO bot_config(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2", [key, val]);
+      return;
+    } catch (e) { console.error("setConf error:", e.message); }
+  }
+  memConfig[key] = val;
+}
+
+async function getTicket(userId) {
+  if (db) {
+    try {
+      const r = await db.query("SELECT channel_id FROM tickets WHERE user_id=$1", [userId]);
+      return r.rows[0]?.channel_id || null;
+    } catch (e) { console.error("getTicket error:", e.message); }
+  }
+  return memTickets[userId] || null;
+}
+
+async function saveTicket(userId, channelId) {
+  if (db) {
+    try {
+      await db.query("INSERT INTO tickets(user_id,channel_id) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET channel_id=$2", [userId, channelId]);
+      return;
+    } catch (e) { console.error("saveTicket error:", e.message); }
+  }
+  memTickets[userId] = channelId;
+}
+
+async function deleteTicket(channelId) {
+  if (db) {
+    try {
+      await db.query("DELETE FROM tickets WHERE channel_id=$1", [channelId]);
+      return;
+    } catch (e) { console.error("deleteTicket error:", e.message); }
+  }
+  for (const [uid, chid] of Object.entries(memTickets)) {
+    if (chid === channelId) delete memTickets[uid];
+  }
+}
+
+// ── Config ────────────────────────────────────────────────────
+const cfg = {
+  lbCh:   process.env.DAILY_LB_CHANNEL   || null,
+  gmCh:   process.env.DAILY_MSG_CHANNEL  || null,
+  annCh:  process.env.ANNOUNCE_CHANNEL   || null,
+  tktCat: process.env.TICKET_CATEGORY_ID || null,
+  tktLog: process.env.TICKET_LOG_CHANNEL || null,
+  lvlCh:  process.env.LEVELUP_CHANNEL    || null,
 };
 
-// ── XP System ────────────────────────────────────────────────
-const xpData     = {};   // { userId: { xp, level, lastMsg, msgCount } }
-const XP_GAIN    = 12;
-const XP_COOL    = 25000; // 25s cooldown
-const XP_NEEDED  = (lvl) => lvl * 120;
-
-function getUser(id) {
-  if (!xpData[id]) xpData[id] = { xp: 0, level: 1, lastMsg: 0, msgCount: 0 };
-  return xpData[id];
-}
-
-async function giveXP(message) {
-  const u   = getUser(message.author.id);
-  const now = Date.now();
-  if (now - u.lastMsg < XP_COOL) return;
-  u.lastMsg  = now;
-  u.msgCount++;
-  u.xp += XP_GAIN + Math.floor(Math.random() * 8);
-  while (u.xp >= XP_NEEDED(u.level)) {
-    u.xp -= XP_NEEDED(u.level);
-    u.level++;
-    await levelUpMsg(message, u.level);
-  }
-}
-
-async function levelUpMsg(message, level) {
-  const chId = config.levelUpChannel;
-  const ch   = chId ? message.client.channels.cache.get(chId) : message.channel;
-  if (!ch) return;
-  const msgs = [
-    `Arre waah! <@${message.author.id}> bhai Level **${level}** pe pahunch gaya! ⚡ Force Town mein legend ban raha hai tu!`,
-    `Kya baat hai <@${message.author.id}>! Level **${level}** — Force Town ka star! ⛩️`,
-    `Level **${level}** unlock! <@${message.author.id}> bhai grind karta reh, top pe milenge! 🔥`,
-    `Oye hoye! <@${message.author.id}> ne Level **${level}** maar diya! ⚡ Aage bhi aisa hi rehna!`,
-  ];
-  const embed = new EmbedBuilder()
-    .setColor(0x00e5ff)
-    .setTitle('⚡ Level Up!')
-    .setDescription(msgs[Math.floor(Math.random() * msgs.length)])
-    .setFooter({ text: 'Force Town ⛩️' })
-    .setTimestamp();
-  ch.send({ embeds: [embed] });
-}
-
-// ── First Message Auto-Reply System ──────────────────────────
-// Bot replies to first message from a user, then waits for THEIR reply to respond again
-const waitingForReply = new Set();  // users bot is waiting to reply to
-const hasSpoken       = new Set();  // users who already got first-message treatment
-
-async function handleFirstMessage(message) {
-  const uid = message.author.id;
-
-  // Already in conversation mode — if user replied, bot responds once then stops
-  if (waitingForReply.has(uid)) {
-    waitingForReply.delete(uid);
-    await sendHinglishReply(message, true); // one reply, then done
-    return true;
-  }
-
-  // First ever message from this user
-  if (!hasSpoken.has(uid)) {
-    hasSpoken.add(uid);
-    waitingForReply.add(uid);
-    await sendFirstWelcome(message);
-    return true;
-  }
-
-  return false; // not handled, let other logic run
-}
-
-async function sendFirstWelcome(message) {
-  const greets = [
-    `Aye <@${message.author.id}> bhai! Force Town mein swagat hai! ⛩️\nMain Nekron hoon — yahan ka bot. Kuch chahiye toh bata, nahi toh chill kar! 😎`,
-    `Oye <@${message.author.id}>! Aagaya finally! ⚡ Force Town mein welcome!\nMain Nekron hoon. Kisi bhi kaam ke liye \`/ticket\` maar do! 🔥`,
-    `Arre bhai <@${message.author.id}> aa gaya! ⛩️ Force Town ki jaan ban ja!\nMain Nekron hoon — thoda AI, thoda jugaad! Kuch chahiye? Bol! 😄`,
-  ];
-  await message.reply(greets[Math.floor(Math.random() * greets.length)]);
-}
-
-async function sendHinglishReply(message, isFollowUp = false) {
-  const userText = message.content.replace(/<@!?\d+>/g, '').trim();
-  if (!userText) return;
-
+async function loadCfg() {
   try {
-    await message.channel.sendTyping();
-    const res = await ai.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const keys = Object.keys(cfg);
+    for (const k of keys) { const v = await getConf(k); if (v) cfg[k] = v; }
+    console.log("✅ Config loaded");
+  } catch (e) { console.error("loadCfg error:", e.message); }
+}
+
+// ── XP System ─────────────────────────────────────────────────
+const XP_COOL = 25000;
+const XP_NEED = (lvl) => lvl * 120;
+
+async function giveXP(msg) {
+  try {
+    const u   = await getUser(msg.author.id);
+    const now = Date.now();
+    if (now - Number(u.last_msg) < XP_COOL) return;
+    let xp = u.xp + 12 + Math.floor(Math.random() * 8);
+    let lv = u.level;
+    let leveled = false;
+    while (xp >= XP_NEED(lv)) { xp -= XP_NEED(lv); lv++; leveled = true; }
+    await updateUser(msg.author.id, { xp, level:lv, last_msg:now, msg_count:u.msg_count+1, daily_msgs:u.daily_msgs+1 });
+    if (leveled) await sendLevelUp(msg, lv);
+  } catch (e) { console.error("giveXP error:", e.message); }
+}
+
+async function sendLevelUp(msg, lv) {
+  try {
+    const chId = cfg.lvlCh;
+    const ch   = chId ? msg.client.channels.cache.get(chId) : msg.channel;
+    if (!ch) return;
+    const texts = [
+      `Arre waah! <@${msg.author.id}> bhai Level **${lv}** pe pahunch gaya! ⚡`,
+      `Kya baat hai <@${msg.author.id}>! Level **${lv}** — Force Town ka star! ⛩️`,
+      `Level **${lv}** unlock! <@${msg.author.id}> grind karta reh! 🔥`,
+    ];
+    await ch.send({ embeds: [
+      new EmbedBuilder().setColor(0x00e5ff).setTitle("⚡ Level Up!")
+        .setDescription(texts[Math.floor(Math.random() * texts.length)])
+        .setFooter({ text: "Force Town ⛩️" }).setTimestamp()
+    ]});
+  } catch (e) { console.error("sendLevelUp error:", e.message); }
+}
+
+// ── First message system ──────────────────────────────────────
+const waitSet = new Set();
+
+async function handleFirst(msg) {
+  try {
+    const u = await getUser(msg.author.id);
+    if (waitSet.has(msg.author.id)) {
+      waitSet.delete(msg.author.id);
+      await aiReply(msg);
+      return true;
+    }
+    if (!u.has_spoken) {
+      await updateUser(msg.author.id, { has_spoken: true });
+      waitSet.add(msg.author.id);
+      const greets = [
+        `Aye <@${msg.author.id}> bhai! Force Town mein swagat hai! ⛩️\nMain Nekron hoon — kuch chahiye toh bata! 😎`,
+        `Oye <@${msg.author.id}>! Force Town mein welcome! ⚡\nMain Nekron hoon. Order ke liye \`/ticket\` maar do! 🔥`,
+        `Arre <@${msg.author.id}> aa gaya! ⛩️\nMain Nekron hoon — thoda AI thoda jugaad! Kuch chahiye? 😄`,
+      ];
+      await msg.reply(greets[Math.floor(Math.random() * greets.length)]);
+      return true;
+    }
+  } catch (e) { console.error("handleFirst error:", e.message); }
+  return false;
+}
+
+async function aiReply(msg) {
+  const text = msg.content.replace(/<@!?\d+>/g, "").trim();
+  if (!text) return;
+  try {
+    await msg.channel.sendTyping();
+    const r = await ai.messages.create({
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 200,
-      system: `Tu Nekron hai — Force Town Discord server ka bot. Force Town, ForceLabs ka server hai jo ItzForcex1 chalata hai. 
-ItzForcex1 Discord server development aur freelance video editing karta hai.
-Tu Hinglish mein baat karta hai (Hindi + English mix). 
-Replies chhoti rakho — max 3-4 lines. Friendly aur chill rehna.
-Kabhi kabhi emojis use karo — zyada nahi.
-Agar koi service ke baare mein puche: Discord dev ₹299 se shuru, video editing flexible budget.
-Order karna ho toh /ticket use karo.
-${isFollowUp ? 'Yeh user ne reply kiya hai toh ek baar acha sa jawab de, friendly rehna.' : ''}`,
-      messages: [{ role: 'user', content: userText }],
+      system: "Tu Nekron hai — Force Town Discord server ka bot. ForceLabs ka server hai jo ItzForcex1 chalata hai. Tu Hinglish mein baat karta hai (Hindi + English mix). Replies chhoti rakho max 3-4 lines. Friendly aur chill rehna. Discord dev Rs.299 se shuru, video editing flexible budget. Order ke liye /ticket.",
+      messages: [{ role: "user", content: text }],
     });
-    await message.reply(res.content[0].text);
+    await msg.reply(r.content[0].text);
   } catch (e) {
-    console.error('AI error:', e);
-    await message.reply('Arre yaar, mera dimaag thoda hang ho gaya! Phir try kar 😅');
+    console.error("aiReply error:", e.message);
+    await msg.reply("Arre yaar hang ho gaya! Phir try kar 😅");
   }
 }
 
-// ── Ticket System ─────────────────────────────────────────────
-const openTickets = {};
+// ── Ticket system ─────────────────────────────────────────────
+async function openTicket(interaction) {
+  try {
+    const { guild, user } = interaction;
+    const existing = await getTicket(user.id);
+    if (existing) return interaction.reply({ content: `⚠️ Tera ticket already khula hai: <#${existing}>`, ephemeral: true });
 
-async function createTicket(interaction) {
-  const { guild, user } = interaction;
-  if (openTickets[user.id]) {
-    return interaction.reply({ content: `⚠️ Bhai tera ticket already khula hai: <#${openTickets[user.id]}>`, ephemeral: true });
+    const ch = await guild.channels.create({
+      name: `ticket-${user.username.toLowerCase().replace(/[^a-z0-9]/g, "-")}`,
+      type: ChannelType.GuildText,
+      parent: cfg.tktCat || null,
+      permissionOverwrites: [
+        { id: guild.id,  deny:  [PermissionFlagsBits.ViewChannel] },
+        { id: user.id,   allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      ],
+    });
+
+    await saveTicket(user.id, ch.id);
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("close_ticket").setLabel("Ticket Band Karo").setStyle(ButtonStyle.Danger).setEmoji("🔒")
+    );
+
+    await ch.send({ embeds: [
+      new EmbedBuilder().setColor(0x8b5cf6).setTitle("🎫 Naya Ticket — Force Town ⛩️")
+        .setDescription(`Aye <@${user.id}> bhai! Ticket khul gaya ✅\n\nInhe bata do:\n**1.** Discord server ya video edit?\n**2.** Kya features chahiye?\n**3.** Budget kitna hai?\n**4.** Deadline kab hai?\n\nItzForcex1 jaldi reply karega! ⚡`)
+        .setFooter({ text: "Kaam ho jaye toh Band Karo dabao." }).setTimestamp()
+    ], components: [row] });
+
+    if (cfg.tktLog) {
+      const logCh = guild.channels.cache.get(cfg.tktLog);
+      if (logCh) await logCh.send({ embeds: [
+        new EmbedBuilder().setColor(0x22c55e).setTitle("📋 Ticket Khula")
+          .setDescription(`<@${user.id}> ne ticket khola → <#${ch.id}>`).setTimestamp()
+      ]});
+    }
+
+    await interaction.reply({ content: `✅ Ticket bana diya: <#${ch.id}>`, ephemeral: true });
+  } catch (e) {
+    console.error("openTicket error:", e.message);
+    if (!interaction.replied) await interaction.reply({ content: "❌ Ticket nahi ban paya! Try again.", ephemeral: true });
   }
-
-  const ch = await guild.channels.create({
-    name: `ticket-${user.username.toLowerCase().replace(/\s/g, '-')}`,
-    type: ChannelType.GuildText,
-    parent: config.ticketCategory || null,
-    permissionOverwrites: [
-      { id: guild.id,  deny:  [PermissionFlagsBits.ViewChannel] },
-      { id: user.id,   allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-    ],
-  });
-
-  openTickets[user.id] = ch.id;
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('close_ticket').setLabel('Ticket Band Karo').setStyle(ButtonStyle.Danger).setEmoji('🔒')
-  );
-
-  const embed = new EmbedBuilder()
-    .setColor(0x8b5cf6)
-    .setTitle('🎫 Naya Ticket — Force Town ⛩️')
-    .setDescription(
-      `Aye <@${user.id}> bhai! Ticket khul gaya ✅\n\n` +
-      `Inhe bata do:\n` +
-      `**1.** Kya chahiye? (Discord server ya video edit?)\n` +
-      `**2.** Kya kya features chahiye?\n` +
-      `**3.** Budget kitna hai?\n` +
-      `**4.** Deadline kab hai?\n\n` +
-      `ItzForcex1 jaldi se reply karega! ⚡`
-    )
-    .setFooter({ text: 'Kaam ho jaye toh Ticket Band Karo button dabao.' })
-    .setTimestamp();
-
-  await ch.send({ embeds: [embed], components: [row] });
-
-  const logCh = config.ticketLogChannel ? guild.channels.cache.get(config.ticketLogChannel) : null;
-  if (logCh) {
-    logCh.send({ embeds: [
-      new EmbedBuilder().setColor(0x22c55e)
-        .setTitle('📋 Ticket Khula')
-        .setDescription(`<@${user.id}> ne ticket khola → <#${ch.id}>`)
-        .setTimestamp()
-    ]});
-  }
-
-  interaction.reply({ content: `✅ Tera ticket bana diya: <#${ch.id}>`, ephemeral: true });
 }
 
 async function closeTicket(interaction) {
-  const ch  = interaction.channel;
-  const uid = Object.keys(openTickets).find(k => openTickets[k] === ch.id);
-  if (uid) delete openTickets[uid];
-
-  const logCh = config.ticketLogChannel ? interaction.guild.channels.cache.get(config.ticketLogChannel) : null;
-  if (logCh) {
-    logCh.send({ embeds: [
-      new EmbedBuilder().setColor(0xef4444)
-        .setTitle('🔒 Ticket Band Hua')
-        .setDescription(`**Channel:** ${ch.name}\n**Band kiya:** <@${interaction.user.id}>`)
-        .setTimestamp()
-    ]});
-  }
-
-  await interaction.reply('🔒 5 seconds mein ticket band ho jayega...');
-  setTimeout(() => ch.delete().catch(() => {}), 5000);
+  try {
+    const ch = interaction.channel;
+    await deleteTicket(ch.id);
+    if (cfg.tktLog) {
+      const logCh = interaction.guild.channels.cache.get(cfg.tktLog);
+      if (logCh) await logCh.send({ embeds: [
+        new EmbedBuilder().setColor(0xef4444).setTitle("🔒 Ticket Band")
+          .setDescription(`**Channel:** ${ch.name}\n**By:** <@${interaction.user.id}>`).setTimestamp()
+      ]});
+    }
+    await interaction.reply("🔒 5 seconds mein band ho jayega...");
+    setTimeout(() => ch.delete().catch(() => {}), 5000);
+  } catch (e) { console.error("closeTicket error:", e.message); }
 }
 
-// ── Daily Good Morning ────────────────────────────────────────
-const gmMessages = [
-  '☀️ **Good Morning Force Town!** ⛩️\nUth ja bhai, naya din aaya hai! Aaj kuch productive kar — grind karo, level up karo! ⚡',
-  '🌅 **Good Morning sab log!** ⛩️\nAaj ka din ekdum fire hoga — bas mehnat karte raho! 🔥 Force Town ke sath start karo apna din!',
-  '☀️ **Subah ho gayi Force Town!** ⛩️\nJo so rahe hain unhe uthao, jo jag rahe hain unhe ek GM bolne do! 😄 Aaj bhi legendary rehna! ⚡',
-  '🌄 **GM GM GM Force Town!** ⛩️\nNaya din, naya mood, naya grind! ItzForcex1 ke server pe aake din shuru karo! 🔥',
-  '☀️ **Uth jao yaar, Force Town bulaa raha hai!** ⛩️\nGood Morning! Aaj kuch bhi ho — positive raho, grind karo! ⚡',
+// ── Good Morning ──────────────────────────────────────────────
+const gmTexts = [
+  "☀️ **Good Morning Force Town!** ⛩️\nUth ja bhai, naya din aaya hai! Grind karo, level up karo! ⚡",
+  "🌅 **Good Morning sab log!** ⛩️\nAaj ka din ekdum fire hoga — mehnat karte raho! 🔥",
+  "☀️ **Subah ho gayi Force Town!** ⛩️\nAaj bhi legendary rehna! ⚡",
+  "🌄 **GM GM GM Force Town!** ⛩️\nNaya din, naya grind! ⚡",
+  "☀️ **Uth jao yaar, Force Town bulaa raha hai!** ⛩️\nPositive raho, grind karo! 🔥",
 ];
 
-async function sendGoodMorning() {
-  const chId = config.dailyMessageChannel;
-  if (!chId) return;
-  const ch = client.channels.cache.get(chId);
-  if (!ch) return;
-  const msg = gmMessages[Math.floor(Math.random() * gmMessages.length)];
-  const embed = new EmbedBuilder()
-    .setColor(0xfbbf24)
-    .setDescription(msg)
-    .setFooter({ text: 'Force Town ⛩️ — Har din naya level!' })
-    .setTimestamp();
-  ch.send({ embeds: [embed] });
+async function sendGM() {
+  try {
+    if (!cfg.gmCh) return;
+    const ch = client.channels.cache.get(cfg.gmCh);
+    if (!ch) return;
+    await ch.send({ embeds: [
+      new EmbedBuilder().setColor(0xfbbf24)
+        .setDescription(gmTexts[Math.floor(Math.random() * gmTexts.length)])
+        .setFooter({ text: "Force Town ⛩️ — Har din naya level!" }).setTimestamp()
+    ]});
+  } catch (e) { console.error("sendGM error:", e.message); }
 }
 
 // ── Daily Leaderboard ─────────────────────────────────────────
-async function sendDailyLeaderboard() {
-  const chId = config.dailyLeaderboardChannel;
-  if (!chId) return;
-  const ch = client.channels.cache.get(chId);
-  if (!ch) return;
-
-  const sorted = Object.entries(xpData)
-    .sort((a, b) => b[1].msgCount - a[1].msgCount)
-    .slice(0, 10);
-
-  const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
-  const desc = sorted.length
-    ? sorted.map(([id, d], i) => `${medals[i]} <@${id}> — **${d.msgCount}** messages | Level **${d.level}**`).join('\n')
-    : 'Aaj kisi ne kuch nahi bola? Yaar chat toh karo! 😅';
-
-  // Reset daily counts
-  Object.values(xpData).forEach(u => u.msgCount = 0);
-
-  const embed = new EmbedBuilder()
-    .setColor(0x00e5ff)
-    .setTitle('🏆 Aaj ke Top Chatters — Force Town ⛩️')
-    .setDescription(desc)
-    .setFooter({ text: 'Kal bhi active raho — top spot pakdo! ⚡' })
-    .setTimestamp();
-  ch.send({ embeds: [embed] });
+async function sendLB() {
+  try {
+    if (!cfg.lbCh) return;
+    const ch = client.channels.cache.get(cfg.lbCh);
+    if (!ch) return;
+    let rows = [];
+    if (db) {
+      const r = await db.query("SELECT user_id,daily_msgs,level FROM users ORDER BY daily_msgs DESC LIMIT 10");
+      await db.query("UPDATE users SET daily_msgs=0");
+      rows = r.rows;
+    } else {
+      rows = Object.values(memUsers).sort((a,b) => b.daily_msgs - a.daily_msgs).slice(0,10);
+      Object.values(memUsers).forEach(u => u.daily_msgs = 0);
+    }
+    const medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
+    const desc = rows.length
+      ? rows.map((x,i) => `${medals[i]} <@${x.user_id}> — **${x.daily_msgs}** messages | Level **${x.level}**`).join("\n")
+      : "Aaj kisi ne kuch nahi bola! Kal toh active rehna! 😅";
+    await ch.send({ embeds: [
+      new EmbedBuilder().setColor(0x00e5ff).setTitle("🏆 Aaj ke Top Chatters — Force Town ⛩️")
+        .setDescription(desc).setFooter({ text: "Kal bhi active raho — top spot pakdo! ⚡" }).setTimestamp()
+    ]});
+  } catch (e) { console.error("sendLB error:", e.message); }
 }
 
-// ── Chat Revive Alert ─────────────────────────────────────────
-const lastMsgTime  = {};  // { channelId: timestamp }
-const DEAD_LIMIT   = 45 * 60 * 1000; // 45 minutes of silence = dead chat
-
-const reviveMsgs = [
-  '💀 **Aye Force Town! Chat mar gaya kya?**\nKoi toh kuch bol yaar! Kya chal raha hai sab ke life mein? 😂',
-  '📻 **Hello hello... koi hai yahan?**\nChat itna quiet hai ki main apni awaaz sun sakta hoon 👻\nKoi toh bol kuch!',
-  '⚡ **Force Town mein sannata kyun hai?**\nSab so gaye kya? Utho utho! Kuch toh bolo! 🔥',
-  '🕸️ **Bhai chat pe cobwebs aa gaye...**\nKoi toh revive karo is chat ko! Kya chal raha hai aaj? 😄',
-  '😴 **Itna quiet mat raho yaar...**\nNekron akela baith ke bore ho raha hai! Kuch toh batao! ⛩️',
-  '🔔 **WAKE UP FORCE TOWN!**\nChat dead ho gayi — koi toh kuch interesting bol! Kya scene hai aaj? ⚡',
+// ── Dead chat revive ──────────────────────────────────────────
+const lastMsg = {};
+const DEAD    = 45 * 60 * 1000;
+const revive  = [
+  "💀 **Aye Force Town! Chat mar gaya kya?**\nKoi toh kuch bol yaar! 😂",
+  "📻 **Hello... koi hai yahan?**\nChat itna quiet hai ki main akela hoon 👻",
+  "⚡ **Force Town mein sannata kyun?**\nSab so gaye kya? Utho! 🔥",
+  "🕸️ **Chat pe cobwebs aa gaye...**\nKoi toh kuch bolo! 😄",
+  "😴 **Nekron akela bore ho raha hai!** ⛩️\nKuch toh batao!",
+  "🔔 **WAKE UP FORCE TOWN!**\nChat dead ho gayi! ⚡",
 ];
 
-async function checkDeadChats() {
+async function checkDead() {
   const now = Date.now();
-  for (const [chId, lastTime] of Object.entries(lastMsgTime)) {
-    if (now - lastTime > DEAD_LIMIT) {
-      const ch = client.channels.cache.get(chId);
-      if (ch && ch.isTextBased()) {
-        const msg = reviveMsgs[Math.floor(Math.random() * reviveMsgs.length)];
-        ch.send(msg).catch(() => {});
-        lastMsgTime[chId] = now; // Reset so it doesn't spam
-      }
+  for (const [chId, t] of Object.entries(lastMsg)) {
+    if (now - t > DEAD) {
+      try {
+        const ch = client.channels.cache.get(chId);
+        if (ch && ch.isTextBased()) {
+          await ch.send(revive[Math.floor(Math.random() * revive.length)]);
+          lastMsg[chId] = now;
+        }
+      } catch (e) { /* ignore */ }
     }
   }
 }
 
-// ── Slash Command Definitions ─────────────────────────────────
-const commands = [
-  new SlashCommandBuilder()
-    .setName('set')
-    .setDescription('Nekron ke channels configure karo')
-    .addChannelOption(o => o.setName('channel').setDescription('Channel select karo').setRequired(true))
-    .addStringOption(o => o.setName('type').setDescription('Kaunsa type?').setRequired(true)
-      .addChoices(
-        { name: 'dailyleaderboard', value: 'dailyleaderboard' },
-        { name: 'dailymessage',     value: 'dailymessage'     },
-        { name: 'announcement',     value: 'announcement'     },
-        { name: 'tickets',          value: 'tickets'          },
-        { name: 'levelups',         value: 'levelups'         },
-      )),
-
-  new SlashCommandBuilder()
-    .setName('send')
-    .setDescription('Kisi channel mein message bhejo')
-    .addChannelOption(o => o.setName('channel').setDescription('Channel select karo').setRequired(true))
-    .addStringOption(o => o.setName('message').setDescription('Message kya bhejein?').setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName('ticket')
-    .setDescription('Service ticket kholo — order karna ho toh!'),
-
-  new SlashCommandBuilder()
-    .setName('rank')
-    .setDescription('Apna ya kisi ka bhi rank dekho')
-    .addUserOption(o => o.setName('user').setDescription('Kiska rank?').setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('leaderboard')
-    .setDescription('Force Town ke top chatters dekho'),
-
-  new SlashCommandBuilder()
-    .setName('services')
-    .setDescription('ForceLabs ki services aur prices dekho'),
-
-  new SlashCommandBuilder()
-    .setName('gm')
-    .setDescription('Good morning message manually bhejo'),
+// ── Slash Commands ────────────────────────────────────────────
+const slashCmds = [
+  new SlashCommandBuilder().setName("set").setDescription("Nekron ke channels configure karo")
+    .addChannelOption(o => o.setName("channel").setDescription("Channel select karo").setRequired(true))
+    .addStringOption(o => o.setName("type").setDescription("Type?").setRequired(true).addChoices(
+      { name: "dailyleaderboard", value: "lbCh"   },
+      { name: "dailymessage",     value: "gmCh"   },
+      { name: "announcement",     value: "annCh"  },
+      { name: "tickets",          value: "tktCat" },
+      { name: "levelups",         value: "lvlCh"  },
+    )),
+  new SlashCommandBuilder().setName("send").setDescription("Kisi channel mein announcement bhejo")
+    .addChannelOption(o => o.setName("channel").setDescription("Channel").setRequired(true))
+    .addStringOption(o => o.setName("message").setDescription("Message").setRequired(true)),
+  new SlashCommandBuilder().setName("ticket").setDescription("Service ticket kholo"),
+  new SlashCommandBuilder().setName("rank").setDescription("Apna ya kisi ka rank dekho")
+    .addUserOption(o => o.setName("user").setDescription("Kiska rank?").setRequired(false)),
+  new SlashCommandBuilder().setName("leaderboard").setDescription("Top members dekho"),
+  new SlashCommandBuilder().setName("services").setDescription("ForceLabs ki services dekho"),
+  new SlashCommandBuilder().setName("gm").setDescription("Good morning manually bhejo"),
 ].map(c => c.toJSON());
 
-async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+async function regCmds() {
   try {
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-      { body: commands }
-    );
-    console.log('✅ Slash commands registered!');
-  } catch (e) {
-    console.error('Commands register error:', e);
-  }
+    if (!process.env.CLIENT_ID || !process.env.GUILD_ID) {
+      console.warn("CLIENT_ID or GUILD_ID missing — skipping command registration");
+      return;
+    }
+    const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+    await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: slashCmds });
+    console.log("✅ Slash commands registered");
+  } catch (e) { console.error("regCmds error:", e.message); }
 }
 
-// ── Handle Slash Commands ─────────────────────────────────────
-async function handleSlash(interaction) {
-  const { commandName } = interaction;
+// ── Handle slash commands ─────────────────────────────────────
+async function handleSlash(i) {
+  const c = i.commandName;
 
-  // /set channel: type:
-  if (commandName === 'set') {
-    if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.reply({ content: '❌ Bhai tujhe permission nahi hai yeh karne ki!', ephemeral: true });
+  if (c === "set") {
+    if (!i.memberPermissions.has(PermissionFlagsBits.ManageGuild))
+      return i.reply({ content: "❌ Permission nahi hai bhai!", ephemeral: true });
+    const ch = i.options.getChannel("channel"), type = i.options.getString("type");
+    cfg[type] = ch.id;
+    await setConf(type, ch.id);
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x22c55e).setTitle("✅ Channel Set!")
+      .setDescription(`<#${ch.id}> set kar diya! ⚡`).setFooter({ text: "Nekron ⛩️" })], ephemeral: true });
+  }
+
+  if (c === "send") {
+    if (!i.memberPermissions.has(PermissionFlagsBits.ManageMessages))
+      return i.reply({ content: "❌ Permission nahi!", ephemeral: true });
+    const ch = i.options.getChannel("channel"), msg = i.options.getString("message");
+    const target = i.guild.channels.cache.get(ch.id);
+    if (!target) return i.reply({ content: "❌ Channel nahi mila!", ephemeral: true });
+    await target.send({ embeds: [new EmbedBuilder().setColor(0x8b5cf6).setDescription(`📢 ${msg}`)
+      .setFooter({ text: `Force Town ⛩️ — by ${i.user.username}` }).setTimestamp()] });
+    return i.reply({ content: `✅ Message bhej diya <#${ch.id}> mein!`, ephemeral: true });
+  }
+
+  if (c === "ticket") return openTicket(i);
+
+  if (c === "rank") {
+    const t = i.options.getUser("user") || i.user;
+    const u = await getUser(t.id);
+    const need = XP_NEED(u.level);
+    const pct  = Math.min(10, Math.floor((u.xp / need) * 10));
+    const bar  = "█".repeat(pct) + "░".repeat(10 - pct);
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x00e5ff).setTitle(`⚡ ${t.username} ka Rank`)
+      .setDescription(`**Level:** ${u.level}\n**XP:** ${u.xp} / ${need}\n**Progress:** \`[${bar}]\`\n**Total Messages:** ${u.msg_count}`)
+      .setThumbnail(t.displayAvatarURL()).setFooter({ text: "Force Town ⛩️ — Chat karo, level lo!" }).setTimestamp()] });
+  }
+
+  if (c === "leaderboard") {
+    let rows = [];
+    if (db) {
+      const r = await db.query("SELECT user_id,level,xp FROM users ORDER BY level DESC,xp DESC LIMIT 10");
+      rows = r.rows;
+    } else {
+      rows = Object.values(memUsers).sort((a,b) => b.level-a.level || b.xp-a.xp).slice(0,10)
+        .map(u => ({ user_id: u.user_id, level: u.level, xp: u.xp }));
     }
-    const ch   = interaction.options.getChannel('channel');
-    const type = interaction.options.getString('type');
-    const typeMap = {
-      dailyleaderboard: 'dailyLeaderboardChannel',
-      dailymessage:     'dailyMessageChannel',
-      announcement:     'announcementChannel',
-      tickets:          'ticketCategory',
-      levelups:         'levelUpChannel',
-    };
-    config[typeMap[type]] = ch.id;
-    return interaction.reply({
-      embeds: [new EmbedBuilder()
-        .setColor(0x22c55e)
-        .setTitle('✅ Channel Set Ho Gaya!')
-        .setDescription(`**${type}** ke liye <#${ch.id}> set kar diya! ⚡`)
-        .setFooter({ text: 'Nekron ⛩️' })],
-      ephemeral: true,
-    });
+    const medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
+    const desc = rows.length
+      ? rows.map((x,idx) => `${medals[idx]} <@${x.user_id}> — Level **${x.level}** (${x.xp} XP)`).join("\n")
+      : "Koi active nahi abhi! Pehle chat karo! 😅";
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x8b5cf6).setTitle("🏆 Force Town Top Members ⛩️")
+      .setDescription(desc).setFooter({ text: "Grind karo, top pe aao! ⚡" }).setTimestamp()] });
   }
 
-  // /send channel: message:
-  if (commandName === 'send') {
-    if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageMessages)) {
-      return interaction.reply({ content: '❌ Bhai tujhe permission nahi!', ephemeral: true });
-    }
-    const ch  = interaction.options.getChannel('channel');
-    const msg = interaction.options.getString('message');
-    const target = interaction.guild.channels.cache.get(ch.id);
-    if (!target) return interaction.reply({ content: '❌ Channel nahi mila!', ephemeral: true });
-
-    const embed = new EmbedBuilder()
-      .setColor(0x8b5cf6)
-      .setDescription(`📢 ${msg}`)
-      .setFooter({ text: `Force Town ⛩️ — Sent by ${interaction.user.username}` })
-      .setTimestamp();
-    await target.send({ embeds: [embed] });
-    return interaction.reply({ content: `✅ Message bhej diya <#${ch.id}> mein!`, ephemeral: true });
-  }
-
-  // /ticket
-  if (commandName === 'ticket') {
-    return createTicket(interaction);
-  }
-
-  // /rank
-  if (commandName === 'rank') {
-    const target = interaction.options.getUser('user') || interaction.user;
-    const u      = getUser(target.id);
-    const needed = XP_NEEDED(u.level);
-    const pct    = Math.floor((u.xp / needed) * 10);
-    const bar    = '█'.repeat(pct) + '░'.repeat(10 - pct);
-    const embed  = new EmbedBuilder()
-      .setColor(0x00e5ff)
-      .setTitle(`⚡ ${target.username} ka Rank`)
-      .setDescription(
-        `**Level:** ${u.level}\n` +
-        `**XP:** ${u.xp} / ${needed}\n` +
-        `**Progress:** \`[${bar}]\`\n` +
-        `**Total Messages:** ${u.msgCount}`
-      )
-      .setThumbnail(target.displayAvatarURL())
-      .setFooter({ text: 'Force Town ⛩️ — Chat karo, level lo!' })
-      .setTimestamp();
-    return interaction.reply({ embeds: [embed] });
-  }
-
-  // /leaderboard
-  if (commandName === 'leaderboard') {
-    const sorted = Object.entries(xpData)
-      .sort((a, b) => b[1].level - a[1].level || b[1].xp - a[1].xp)
-      .slice(0, 10);
-    const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
-    const desc = sorted.length
-      ? sorted.map(([id, d], i) => `${medals[i]} <@${id}> — Level **${d.level}** (${d.xp} XP)`).join('\n')
-      : 'Abhi tak koi active nahi — pehle chat karo bhai! 😅';
-    const embed = new EmbedBuilder()
-      .setColor(0x8b5cf6)
-      .setTitle('🏆 Force Town — Top Members ⛩️')
-      .setDescription(desc)
-      .setFooter({ text: 'Grind karte raho — top pe aao! ⚡' })
-      .setTimestamp();
-    return interaction.reply({ embeds: [embed] });
-  }
-
-  // /services
-  if (commandName === 'services') {
-    const embed = new EmbedBuilder()
-      .setColor(0x00e5ff)
-      .setTitle('⚡ ForceLabs — Kya Kya Milega?')
+  if (c === "services") {
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x00e5ff).setTitle("⚡ ForceLabs — Kya Kya Milega?")
       .addFields(
-        { name: '🛠️ Discord Development', value: 'Server setup, custom bots, automation, branding\nStarting **₹299** onward', inline: false },
-        { name: '🎬 Video Editing', value: 'Reels, YouTube, cinematic montages, gaming highlights\n**Flexible budget** — koi bhi amount chalega!', inline: false },
-        { name: '📩 Order Karna Hai?', value: '`/ticket` maar do ya DM karo **ItzForcex1** ko\n🌐 forcelabs.netlify.app', inline: false },
-      )
-      .setFooter({ text: 'Force Town ⛩️ — Built Different by ForceLabs' })
-      .setTimestamp();
-    return interaction.reply({ embeds: [embed] });
-  }
-
-  // /gm
-  if (commandName === 'gm') {
-    if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageMessages)) {
-      return interaction.reply({ content: '❌ Permission nahi hai!', ephemeral: true });
-    }
-    await sendGoodMorning();
-    return interaction.reply({ content: '✅ Good morning message bhej diya!', ephemeral: true });
-  }
-}
-
-// ── READY ─────────────────────────────────────────────────────
-client.once('ready', async () => {
-  console.log(`✅ Nekron online — ${client.user.tag}`);
-  client.user.setUsername('Nekron').catch(() => {});
-  client.user.setActivity('Force Town ⛩️ | /ticket', { type: ActivityType.Watching });
-
-  await registerCommands();
-
-  // Good Morning — 7:00 AM IST = 1:30 AM UTC
-  cron.schedule('30 1 * * *', () => {
-    sendGoodMorning();
-    console.log('☀️ Good Morning sent');
-  });
-
-  // Daily Leaderboard — 11:55 PM IST = 6:25 PM UTC
-  cron.schedule('25 18 * * *', () => {
-    sendDailyLeaderboard();
-    console.log('🏆 Daily leaderboard sent');
-  });
-
-  // Check dead chats every 15 minutes
-  cron.schedule('*/15 * * * *', () => {
-    checkDeadChats();
-  });
-});
-
-// ── MESSAGE CREATE ────────────────────────────────────────────
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) retu
+        { name: "🛠️ Discord Development", val
